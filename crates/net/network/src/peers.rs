@@ -135,6 +135,8 @@ impl PeersManager {
             }
         }
 
+        println!("{:?}", peers);
+
         for NodeRecord { address, tcp_port, udp_port, id } in basic_nodes {
             peers.entry(id).or_insert_with(|| {
                 Peer::new(PeerAddr::new_with_ports(address, tcp_port, Some(udp_port)))

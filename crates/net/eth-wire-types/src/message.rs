@@ -230,7 +230,7 @@ pub enum EthMessage<N: NetworkPrimitives = EthNetworkPrimitives> {
     NewPooledTransactionHashes68(NewPooledTransactionHashes68),
     // The following messages are request-response message pairs
     /// Represents a `GetBlockHeaders` request-response pair.
-    GetBlockHeaders(RequestPair<GetBlockHeaders>),
+    GetBlockHeaders(RequestPair<GetBlock Headers>),
     /// Represents a `BlockHeaders` request-response pair.
     #[cfg_attr(
         feature = "serde",
