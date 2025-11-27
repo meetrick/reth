@@ -785,6 +785,9 @@ impl PeersManager {
         match self.peers.entry(peer_id) {
             Entry::Occupied(mut entry) => {
                 let peer = entry.get_mut();
+                if peer.kind.is_trusted() {
+                    println!("{:?} {:?}", peer.kind, kind);
+                }
                 peer.kind = kind;
                 peer.fork_id = fork_id.map(Box::new);
                 peer.addr = addr;
