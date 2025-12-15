@@ -1,4 +1,9 @@
-# Publishes the Docker image.
+# Publishes Docker images.
+#
+# Triggers:
+#   - Push tag v*: builds release (RC or latest)
+#   - Schedule: builds nightly + profiling
+#   - Manual: builds git-sha or nightly
 
 name: docker
 
@@ -6,60 +11,55 @@ on:
   push:
     tags:
       - v*
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Build type"
+        required: true
+        type: choice
+        options:
+          - git-sha
+          - nightly
+        default: git-sha
+      dry_run:
+        description: "Skip pushing images (dry run)"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
-  build-rc:
-    if: contains(github.ref, '-rc')
-    name: build and push as release candidate
+  prepare:
+    name: Prepare build parameters
     runs-on: ubuntu-24.04
-    permissions:
-      packages: write
-      contents: read
-      id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - binary: reth
-            image_name: ghcr.io/${{ github.repository_owner }}/reth
-            manifest_path: bin/reth
-            features: jemalloc asm-keccak
-          - binary: op-reth
-            image_name: ghcr.io/${{ github.repository_owner }}/op-reth
-            manifest_path: crates/optimism/bin
-            features: jemalloc asm-keccak
+    outputs:
+      build_matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v6
-      - name: Set up Depot CLI
-        uses: depot/setup-action@v1
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Extract version from tag
-        id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-      - name: Build and push ${{ matrix.binary }} image
-        uses: depot/build-push-action@v1
-        with:
-          project: ${{ vars.DEPOT_PROJECT_ID }}
-          context: .
-          file: Dockerfile.depot
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ matrix.image_name }}:${{ steps.version.outputs.VERSION }}
-          build-args: |
-            BINARY=${{ matrix.binary }}
-            MANIFEST_PATH=${{ matrix.manifest_path }}
-            BUILD_PROFILE=maxperf
-            FEATURES=${{ matrix.features }}
+      - name: Determine build matrix
+        id: set-matrix
+        run: |
+          # Base builds (always included)
+          BUILDS='[
+            {"binary": "reth", "image_name": "ghcr.io/${{ github.repository_owner }}/reth", "manifest_path": "bin/reth", "features": "jemalloc asm-keccak", "profile": "maxperf"},
+            {"binary": "op-reth", "image_name": "ghcr.io/${{ github.repository_owner }}/op-reth", "manifest_path": "crates/optimism/bin", "features": "jemalloc asm-keccak", "profile": "maxperf"}
+          ]'
+
+          # Add profiling builds for nightly
+          if [[ "${{ github.event_name }}" == "schedule" ]] || [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.build_type }}" == "nightly" ]]; then
+            BUILDS='[
+              {"binary": "reth", "image_name": "ghcr.io/${{ github.repository_owner }}/reth", "manifest_path": "bin/reth", "features": "jemalloc asm-keccak", "profile": "maxperf", "tag_suffix": "nightly"},
+              {"binary": "reth", "image_name": "ghcr.io/${{ github.repository_owner }}/reth", "manifest_path": "bin/reth", "features": "jemalloc asm-keccak jemalloc-prof", "profile": "profiling", "tag_suffix": "nightly-profiling"},
+              {"binary": "op-reth", "image_name": "ghcr.io/${{ github.repository_owner }}/op-reth", "manifest_path": "crates/optimism/bin", "features": "jemalloc asm-keccak", "profile": "maxperf", "tag_suffix": "nightly"},
+              {"binary": "op-reth", "image_name": "ghcr.io/${{ github.repository_owner }}/op-reth", "manifest_path": "crates/optimism/bin", "features": "jemalloc asm-keccak jemalloc-prof", "profile": "profiling", "tag_suffix": "nightly-profiling"}
+            ]'
+          fi
+
+          echo "matrix=$BUILDS" >> "$GITHUB_OUTPUT"
 
   build:
-    if: ${{ !contains(github.ref, '-rc') }}
-    name: build and push as latest
+    name: Build ${{ matrix.binary }} (${{ matrix.profile }})
+    needs: prepare
     runs-on: ubuntu-24.04
     permissions:
       packages: write
@@ -68,28 +68,50 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - binary: reth
-            image_name: ghcr.io/${{ github.repository_owner }}/reth
-            manifest_path: bin/reth
-            features: jemalloc asm-keccak
-          - binary: op-reth
-            image_name: ghcr.io/${{ github.repository_owner }}/op-reth
-            manifest_path: crates/optimism/bin
-            features: jemalloc asm-keccak
+        include: ${{ fromJson(needs.prepare.outputs.build_matrix) }}
     steps:
       - uses: actions/checkout@v6
+
       - name: Set up Depot CLI
         uses: depot/setup-action@v1
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Extract version from tag
-        id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute tags
+        id: tags
+        run: |
+          IMAGE="${{ matrix.image_name }}"
+          TAGS=""
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            # Tag push - extract version
+            VERSION="${GITHUB_REF#refs/tags/}"
+            TAGS="${IMAGE}:${VERSION}"
+            # Add 'latest' tag for non-RC releases
+            if [[ ! "$VERSION" =~ -rc ]]; then
+              TAGS="${TAGS},${IMAGE}:latest"
+            fi
+
+          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
+            # Scheduled nightly build
+            TAGS="${IMAGE}:${{ matrix.tag_suffix }}"
+
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.build_type }}" == "nightly" ]]; then
+              TAGS="${IMAGE}:${{ matrix.tag_suffix }}"
+            else
+              # git-sha build
+              TAGS="${IMAGE}:${{ github.sha }}"
+            fi
+          fi
+
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+
       - name: Build and push ${{ matrix.binary }} image
         uses: depot/build-push-action@v1
         with:
@@ -97,12 +119,10 @@ jobs:
           context: .
           file: Dockerfile.depot
           platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ matrix.image_name }}:${{ steps.version.outputs.VERSION }}
-            ${{ matrix.image_name }}:latest
+          push: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+          tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             BINARY=${{ matrix.binary }}
             MANIFEST_PATH=${{ matrix.manifest_path }}
-            BUILD_PROFILE=maxperf
+            BUILD_PROFILE=${{ matrix.profile }}
             FEATURES=${{ matrix.features }}
