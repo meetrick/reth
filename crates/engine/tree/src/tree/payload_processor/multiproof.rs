@@ -5,7 +5,7 @@ use alloy_eip7928::BlockAccessList;
 use alloy_evm::block::StateChangeSource;
 use alloy_primitives::{
     keccak256,
-    map::{B256Set, HashSet},
+    map::{B256Set, Entry, HashSet},
     B256,
 };
 use crossbeam_channel::{unbounded, Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
@@ -1118,18 +1118,6 @@ impl MultiProofTask {
                 while accumulated_targets < STATE_UPDATE_MAX_BATCH_TARGETS {
                     match self.rx.try_recv() {
                         Ok(MultiProofMessage::StateUpdate(next_source, next_update)) => {
-                            let (batch_source, batch_update) = &ctx.accumulated_state_updates[0];
-                            if !can_batch_state_update(
-                                *batch_source,
-                                batch_update,
-                                next_source,
-                                &next_update,
-                            ) {
-                                ctx.pending_msg =
-                                    Some(MultiProofMessage::StateUpdate(next_source, next_update));
-                                break;
-                            }
-
                             let next_estimate = estimate_evm_state_targets(&next_update);
                             // Would exceed batch cap; leave pending to dispatch on next iteration.
                             if accumulated_targets + next_estimate > STATE_UPDATE_MAX_BATCH_TARGETS
@@ -1170,7 +1158,41 @@ impl MultiProofTask {
                     .expect("state update batch always has at least one entry");
                 for (next_source, next_update) in accumulated_iter {
                     batch_source = next_source;
-                    merged_update.extend(next_update);
+                    for (address, acc) in next_update {
+                        if !acc.is_touched() {
+                            continue;
+                        }
+                        match merged_update.entry(address) {
+                            Entry::Vacant(vacant) => {
+                                vacant.insert(acc);
+                            }
+                            Entry::Occupied(mut occupied) => {
+                                let value = occupied.get_mut();
+
+                                if value.is_selfdestructed() {
+                                    // If account was selfdestructed before, we can just replace its storage
+                                    value.storage = acc.storage;
+                                } else {
+                                    // Otherwise, we need to update the existing storage
+                                    for (slot, new_value) in acc.storage {
+                                        match value.storage.entry(slot) {
+                                            Entry::Vacant(vacant) => {
+                                                vacant.insert(new_value);
+                                            }
+                                            Entry::Occupied(mut occupied) => {
+                                                occupied.get_mut().present_value =
+                                                    new_value.present_value;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                value.info = acc.info;
+                                value.status |= acc.status;
+                                value.transaction_id = acc.transaction_id;
+                            }
+                        }
+                    }
                 }
 
                 let batch_len = merged_update.len();
