@@ -316,12 +316,14 @@ where
         + HashedPostStateProvider
         + TrieReader
         + Clone
+        + Send
+        + Sync
         + 'static,
     <P as DatabaseProviderFactory>::Provider:
         BlockReader<Block = N::Block, Header = N::BlockHeader>,
     C: ConfigureEvm<Primitives = N> + 'static,
     T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
-    V: EngineValidator<T>,
+    V: EngineValidator<T, Provider = P>,
 {
     /// Creates a new [`EngineApiTreeHandler`].
     #[expect(clippy::too_many_arguments)]
@@ -2517,7 +2519,7 @@ where
         &mut self,
         block_id: BlockWithParent,
         input: Input,
-        execute: impl FnOnce(&mut V, Input, TreeCtx<'_, N>) -> Result<ExecutedBlock<N>, Err>,
+        execute: impl FnOnce(&mut V, Input, TreeCtx<'_, N, P>) -> Result<ExecutedBlock<N>, Err>,
         convert_to_block: impl FnOnce(&mut Self, Input) -> Result<SealedBlock<N::Block>, Err>,
     ) -> Result<InsertPayloadOk, Err>
     where
@@ -2589,8 +2591,12 @@ where
             Ok(is_fork) => is_fork,
         };
 
-        let mut ctx = TreeCtx::new(&mut self.state, &self.canonical_in_memory_state);
-        ctx.set_precomputed_state(state_provider, provider_builder);
+        let ctx = TreeCtx::with_precomputed(
+            &mut self.state,
+            &self.canonical_in_memory_state,
+            state_provider,
+            provider_builder,
+        );
 
         let start = Instant::now();
 
