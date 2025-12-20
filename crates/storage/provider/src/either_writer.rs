@@ -9,7 +9,7 @@ use crate::{
     providers::{StaticFileProvider, StaticFileProviderRWRefMut},
     StaticFileProviderFactory,
 };
-use alloy_primitives::{map::HashMap, Address, BlockNumber, TxHash, TxNumber};
+use alloy_primitives::{map::HashMap, Address, BlockNumber, TxHash, TxNumber, B256};
 use reth_db::{
     cursor::DbCursorRO,
     static_file::TransactionSenderMask,
@@ -30,6 +30,8 @@ use reth_storage_api::{DBProvider, NodePrimitivesProvider, StorageSettingsCache}
 use reth_storage_errors::provider::ProviderResult;
 use strum::{Display, EnumIs};
 
+use crate::providers::{find_changeset_block_from_index, HistoryInfo};
+
 /// Type alias for [`EitherReader`] constructors.
 type EitherReaderTy<'a, P, T> =
     EitherReader<'a, CursorTy<<P as DBProvider>::Tx, T>, <P as NodePrimitivesProvider>::Primitives>;
@@ -44,9 +46,9 @@ type EitherWriterTy<'a, P, T> = EitherWriter<
 // Helper types so constructors stay exported even when RocksDB feature is off.
 // Historical data tables use a write-only RocksDB batch (no read-your-writes needed).
 #[cfg(all(unix, feature = "rocksdb"))]
-type RocksBatchArg<'a> = crate::providers::rocksdb::RocksDBBatch;
+type RocksBatchArg<'a> = &'a mut crate::providers::rocksdb::RocksDBBatch;
 #[cfg(not(all(unix, feature = "rocksdb")))]
-type RocksBatchArg<'a> = ();
+type RocksBatchArg<'a> = &'a mut ();
 
 #[cfg(all(unix, feature = "rocksdb"))]
 type RocksTxRefArg<'a> = &'a crate::providers::rocksdb::RocksTx<'a>;
@@ -61,8 +63,9 @@ pub enum EitherWriter<'a, CURSOR, N> {
     /// Write to static file
     StaticFile(StaticFileProviderRWRefMut<'a, N>),
     /// Write to `RocksDB` using a write-only batch (historical tables).
+    /// The batch is borrowed and committed at provider commit time.
     #[cfg(all(unix, feature = "rocksdb"))]
-    RocksDB(RocksDBBatch),
+    RocksDB(&'a mut RocksDBBatch),
 }
 
 impl<'a> EitherWriter<'a, (), ()> {
@@ -187,21 +190,6 @@ impl<'a> EitherWriter<'a, (), ()> {
 }
 
 impl<'a, CURSOR, N: NodePrimitives> EitherWriter<'a, CURSOR, N> {
-    /// Extracts the raw `RocksDB` write batch from this writer, if it contains one.
-    ///
-    /// Returns `Some(WriteBatchWithTransaction)` for [`Self::RocksDB`] variant,
-    /// `None` for other variants.
-    ///
-    /// This is used to defer `RocksDB` commits to the provider level, ensuring all
-    /// storage commits (MDBX, static files, `RocksDB`) happen atomically in a single place.
-    #[cfg(all(unix, feature = "rocksdb"))]
-    pub fn into_raw_rocksdb_batch(self) -> Option<rocksdb::WriteBatchWithTransaction<true>> {
-        match self {
-            Self::Database(_) | Self::StaticFile(_) => None,
-            Self::RocksDB(batch) => Some(batch.into_inner()),
-        }
-    }
-
     /// Increment the block number.
     ///
     /// Relevant only for [`Self::StaticFile`]. It is a no-op for [`Self::Database`].
@@ -585,6 +573,45 @@ where
             Self::RocksDB(tx) => tx.get::<tables::StoragesHistory>(key),
         }
     }
+
+    /// Reads all history shards for a given address and storage key.
+    ///
+    /// Returns all `(StorageShardedKey, BlockNumberList)` pairs for the address/key combination,
+    /// ordered by `highest_block_number`. Used for prefix iteration over sharded storage history.
+    pub fn read_storage_history_shards(
+        &mut self,
+        address: Address,
+        storage_key: B256,
+    ) -> ProviderResult<Vec<(StorageShardedKey, BlockNumberList)>> {
+        match self {
+            Self::Database(cursor, _) => {
+                let start = StorageShardedKey::new(address, storage_key, 0);
+                let mut out = Vec::new();
+                for entry in cursor.walk(Some(start))? {
+                    let (key, value) = entry.map_err(ProviderError::from)?;
+                    if key.address != address || key.sharded_key.key != storage_key {
+                        break;
+                    }
+                    out.push((key, value));
+                }
+                Ok(out)
+            }
+            Self::StaticFile(_, _) => Err(ProviderError::UnsupportedProvider),
+            #[cfg(all(unix, feature = "rocksdb"))]
+            Self::RocksDB(tx) => {
+                let start = StorageShardedKey::new(address, storage_key, 0);
+                let mut out = Vec::new();
+                for entry in tx.iter_from::<tables::StoragesHistory>(start)? {
+                    let (key, value) = entry?;
+                    if key.address != address || key.sharded_key.key != storage_key {
+                        break;
+                    }
+                    out.push((key, value));
+                }
+                Ok(out)
+            }
+        }
+    }
 }
 
 impl<CURSOR, N: NodePrimitives> EitherReader<'_, CURSOR, N>
@@ -601,6 +628,143 @@ where
             Self::StaticFile(_, _) => Err(ProviderError::UnsupportedProvider),
             #[cfg(all(unix, feature = "rocksdb"))]
             Self::RocksDB(tx) => tx.get::<tables::AccountsHistory>(key),
+        }
+    }
+
+    /// Reads all history shards for a given address.
+    ///
+    /// Returns all `(ShardedKey, BlockNumberList)` pairs for the address, ordered by
+    /// `highest_block_number`. Used for prefix iteration over sharded history data.
+    pub fn read_account_history_shards(
+        &mut self,
+        address: Address,
+    ) -> ProviderResult<Vec<(ShardedKey<Address>, BlockNumberList)>> {
+        match self {
+            Self::Database(cursor, _) => {
+                let start = ShardedKey::new(address, 0);
+                let mut out = Vec::new();
+                for entry in cursor.walk(Some(start))? {
+                    let (key, value) = entry.map_err(ProviderError::from)?;
+                    if key.key != address {
+                        break;
+                    }
+                    out.push((key, value));
+                }
+                Ok(out)
+            }
+            Self::StaticFile(_, _) => Err(ProviderError::UnsupportedProvider),
+            #[cfg(all(unix, feature = "rocksdb"))]
+            Self::RocksDB(tx) => {
+                let start = ShardedKey::new(address, 0);
+                let mut out = Vec::new();
+                for entry in tx.iter_from::<tables::AccountsHistory>(start)? {
+                    let (key, value) = entry?;
+                    if key.key != address {
+                        break;
+                    }
+                    out.push((key, value));
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Lookup account history and return [`HistoryInfo`] directly.
+    ///
+    /// Uses the rank/select logic to efficiently find the first block >= target
+    /// where the account was modified.
+    pub fn account_history_info(
+        &mut self,
+        address: Address,
+        block_number: BlockNumber,
+        lowest_available_block_number: Option<BlockNumber>,
+    ) -> ProviderResult<HistoryInfo> {
+        match self {
+            Self::Database(cursor, _) => {
+                // Lookup the history chunk in the history index. If the key does not appear in the
+                // index, the first chunk for the next key will be returned so we filter out chunks
+                // that have a different key.
+                let key = ShardedKey::new(address, block_number);
+                if let Some(chunk) =
+                    cursor.seek(key)?.filter(|(k, _)| k.key == address).map(|x| x.1)
+                {
+                    let has_prev = cursor.prev()?.is_some_and(|(k, _)| k.key == address);
+                    Ok(find_changeset_block_from_index(
+                        &chunk,
+                        block_number,
+                        has_prev,
+                        lowest_available_block_number,
+                    ))
+                } else if lowest_available_block_number.is_some() {
+                    // The key may have been written, but due to pruning we may not have changesets
+                    // and history, so we need to make a plain state lookup.
+                    Ok(HistoryInfo::MaybeInPlainState)
+                } else {
+                    // The key has not been written to at all.
+                    Ok(HistoryInfo::NotYetWritten)
+                }
+            }
+            Self::StaticFile(_, _) => Err(ProviderError::UnsupportedProvider),
+            #[cfg(all(unix, feature = "rocksdb"))]
+            Self::RocksDB(tx) => {
+                tx.account_history_info(address, block_number, lowest_available_block_number)
+            }
+        }
+    }
+}
+
+impl<CURSOR, N: NodePrimitives> EitherReader<'_, CURSOR, N>
+where
+    CURSOR: DbCursorRO<tables::StoragesHistory>,
+{
+    /// Lookup storage history and return [`HistoryInfo`] directly.
+    ///
+    /// Uses the rank/select logic to efficiently find the first block >= target
+    /// where the storage slot was modified.
+    pub fn storage_history_info(
+        &mut self,
+        address: Address,
+        storage_key: B256,
+        block_number: BlockNumber,
+        lowest_available_block_number: Option<BlockNumber>,
+    ) -> ProviderResult<HistoryInfo> {
+        match self {
+            Self::Database(cursor, _) => {
+                // Lookup the history chunk in the history index. If the key does not appear in the
+                // index, the first chunk for the next key will be returned so we filter out chunks
+                // that have a different key.
+                let key = StorageShardedKey::new(address, storage_key, block_number);
+                if let Some(chunk) = cursor
+                    .seek(key)?
+                    .filter(|(k, _)| k.address == address && k.sharded_key.key == storage_key)
+                    .map(|x| x.1)
+                {
+                    let has_prev = cursor.prev()?.is_some_and(|(k, _)| {
+                        k.address == address && k.sharded_key.key == storage_key
+                    });
+                    Ok(find_changeset_block_from_index(
+                        &chunk,
+                        block_number,
+                        has_prev,
+                        lowest_available_block_number,
+                    ))
+                } else if lowest_available_block_number.is_some() {
+                    // The key may have been written, but due to pruning we may not have changesets
+                    // and history, so we need to make a plain state lookup.
+                    Ok(HistoryInfo::MaybeInPlainState)
+                } else {
+                    // The key has not been written to at all.
+                    Ok(HistoryInfo::NotYetWritten)
+                }
+            }
+            Self::StaticFile(_, _) => Err(ProviderError::UnsupportedProvider),
+            #[cfg(all(unix, feature = "rocksdb"))]
+            Self::RocksDB(tx) => tx.storage_history_info(
+                address,
+                storage_key,
+                block_number,
+                lowest_available_block_number,
+            ),
         }
     }
 }
@@ -733,22 +897,25 @@ mod rocksdb_tests {
 
         // Get the RocksDB batch from the provider
         let rocksdb = factory.rocksdb_provider();
-        let batch = rocksdb.batch();
+        let mut batch = rocksdb.batch();
 
         // Create EitherWriter with RocksDB
         let provider = factory.database_provider_rw().unwrap();
-        let mut writer = EitherWriter::new_transaction_hash_numbers(&provider, batch).unwrap();
+        {
+            let mut writer =
+                EitherWriter::new_transaction_hash_numbers(&provider, &mut batch).unwrap();
 
-        // Verify we got a RocksDB writer
-        assert!(matches!(writer, EitherWriter::RocksDB(_)));
+            // Verify we got a RocksDB writer
+            assert!(matches!(writer, EitherWriter::RocksDB(_)));
 
-        // Write transaction hash numbers (append_only=false since we're using RocksDB)
-        writer.put_transaction_hash_number(hash1, tx_num1, false).unwrap();
-        writer.put_transaction_hash_number(hash2, tx_num2, false).unwrap();
+            // Write transaction hash numbers (append_only=false since we're using RocksDB)
+            writer.put_transaction_hash_number(hash1, tx_num1, false).unwrap();
+            writer.put_transaction_hash_number(hash2, tx_num2, false).unwrap();
+        }
 
-        // Extract the batch and register with provider for commit
-        if let Some(batch) = writer.into_raw_rocksdb_batch() {
-            provider.set_pending_rocksdb_batch(batch);
+        // Register the batch with provider for commit
+        if !batch.is_empty() {
+            provider.set_pending_rocksdb_batch(batch.into_inner());
         }
 
         // Commit via provider - this commits RocksDB batch too
@@ -779,14 +946,17 @@ mod rocksdb_tests {
         assert_eq!(rocksdb.get::<tables::TransactionHashNumbers>(hash).unwrap(), Some(tx_num));
 
         // Now delete using EitherWriter
-        let batch = rocksdb.batch();
+        let mut batch = rocksdb.batch();
         let provider = factory.database_provider_rw().unwrap();
-        let mut writer = EitherWriter::new_transaction_hash_numbers(&provider, batch).unwrap();
-        writer.delete_transaction_hash_number(hash).unwrap();
+        {
+            let mut writer =
+                EitherWriter::new_transaction_hash_numbers(&provider, &mut batch).unwrap();
+            writer.delete_transaction_hash_number(hash).unwrap();
+        }
 
-        // Extract the batch and commit via provider
-        if let Some(batch) = writer.into_raw_rocksdb_batch() {
-            provider.set_pending_rocksdb_batch(batch);
+        // Register the batch and commit via provider
+        if !batch.is_empty() {
+            provider.set_pending_rocksdb_batch(batch.into_inner());
         }
         provider.commit().unwrap();
 
@@ -950,20 +1120,22 @@ mod rocksdb_tests {
 
         // Get the RocksDB batch from the provider
         let rocksdb = factory.rocksdb_provider();
-        let batch = rocksdb.batch();
+        let mut batch = rocksdb.batch();
 
         // Create provider and EitherWriter
         let provider = factory.database_provider_rw().unwrap();
-        let mut writer = EitherWriter::new_transaction_hash_numbers(&provider, batch).unwrap();
+        {
+            let mut writer =
+                EitherWriter::new_transaction_hash_numbers(&provider, &mut batch).unwrap();
 
-        // Write transaction hash numbers (append_only=false since we're using RocksDB)
-        writer.put_transaction_hash_number(hash1, tx_num1, false).unwrap();
-        writer.put_transaction_hash_number(hash2, tx_num2, false).unwrap();
+            // Write transaction hash numbers (append_only=false since we're using RocksDB)
+            writer.put_transaction_hash_number(hash1, tx_num1, false).unwrap();
+            writer.put_transaction_hash_number(hash2, tx_num2, false).unwrap();
+        }
 
-        // Extract the raw batch from the writer and register it with the provider
-        let raw_batch = writer.into_raw_rocksdb_batch();
-        if let Some(batch) = raw_batch {
-            provider.set_pending_rocksdb_batch(batch);
+        // Register the batch with the provider
+        if !batch.is_empty() {
+            provider.set_pending_rocksdb_batch(batch.into_inner());
         }
 
         // Data should NOT be visible yet (batch not committed)
