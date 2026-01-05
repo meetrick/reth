@@ -28,7 +28,7 @@ use reth_primitives_traits::Recovered;
 use reth_revm::{cancelled::CancelOnDrop, database::StateProviderDatabase, db::State};
 use reth_rpc_convert::{RpcConvert, RpcTxReq};
 use reth_rpc_eth_types::{
-    cache::db::StateProviderTraitObjWrapper,
+    cache::{db::StateProviderTraitObjWrapper, state_provider::CachedStateProvider},
     error::{AsEthApiError, FromEthApiError},
     simulate::{self, EthSimulateError},
     EthApiError, StateCacheDb,
@@ -569,7 +569,12 @@ pub trait Call:
         }
     }
 
-    /// Executes the closure with the state that corresponds to the given [`BlockId`] on a new task
+    /// Executes the closure with the state that corresponds to the given [`BlockId`] on a new task.
+    ///
+    /// This function wraps the state provider with [`CachedStateProvider`] to cache database reads
+    /// within the scope of a single RPC request. This significantly improves performance for
+    /// operations that access the same accounts/storage multiple times, such as transaction
+    /// tracing where prior transactions need to be replayed.
     fn spawn_with_state_at_block<F, R>(
         &self,
         at: impl Into<BlockId>,
@@ -582,8 +587,16 @@ pub trait Call:
         let at = at.into();
         self.spawn_blocking_io_fut(move |this| async move {
             let state = this.state_at_block_id(at).await?;
+
+            // Wrap with CachedStateProvider to cache historical state reads within this request.
+            // This avoids repeated expensive database lookups for the same accounts/storage
+            // during transaction replay and tracing operations.
+            let cached_state: StateProviderBox = Box::new(CachedStateProvider::new(state));
+
             let db = State::builder()
-                .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(state)))
+                .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
+                    cached_state,
+                )))
                 .build();
             f(this, db)
         })

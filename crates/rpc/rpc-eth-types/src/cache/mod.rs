@@ -28,6 +28,7 @@ pub mod config;
 pub mod db;
 pub mod metrics;
 pub mod multi_consumer;
+pub mod state_provider;
 
 /// The type that can send the response to a requested [`RecoveredBlock`]
 type BlockTransactionsResponseSender<T> = oneshot::Sender<ProviderResult<Option<Vec<T>>>>;
